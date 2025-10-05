@@ -1,0 +1,1264 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Lockers Property Maintenance</title>
+    <!-- Load Tailwind CSS -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <!-- Load Inter Font -->
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700;900&display=swap');
+        body { font-family: 'Inter', sans-serif; }
+    </style>
+    <!-- Firebase SDK Imports (MUST be in this order) -->
+    <script src="https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js"></script>
+    <script src="https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js"></script>
+    <script src="https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js"></script>
+    <script>
+        // Use global namespace for easy access, as per our Vanilla JS setup
+        const firebase = {
+            initializeApp: firebase.initializeApp,
+            getAuth: firebase.getAuth,
+            getFirestore: firebase.getFirestore,
+            setLogLevel: firebase.setLogLevel,
+            
+            // Firestore exports
+            getDoc: firebase.getDoc,
+            setDoc: firebase.setDoc,
+            updateDoc: firebase.updateDoc,
+            deleteDoc: firebase.deleteDoc,
+            onSnapshot: firebase.onSnapshot,
+            collection: firebase.collection,
+            doc: firebase.doc,
+            query: firebase.query,
+            where: firebase.where,
+            addDoc: firebase.addDoc,
+            serverTimestamp: firebase.serverTimestamp,
+            Timestamp: firebase.Timestamp,
+            runTransaction: firebase.runTransaction,
+
+            // Auth exports
+            signInAnonymously: firebase.signInAnonymously,
+            signInWithCustomToken: firebase.signInWithCustomToken,
+            onAuthStateChanged: firebase.onAuthStateChanged,
+        };
+    </script>
+</head>
+<body>
+    <div id="app-container">
+        <!-- App content will load here -->
+    </div>
+    <script>
+        // --- Global State and Initialization ---
+
+        // Global variables for Firebase (required by the Canvas environment)
+        // NOTE: These variables must be replaced with your actual keys upon deployment.
+        const appId = 'default-app-id'; // Use a fixed default ID for local testing
+        // This is where you will paste your actual firebaseConfig upon deployment:
+        const firebaseConfig = {}; 
+        const initialAuthToken = null;
+
+        // Firebase instances (will be initialized later)
+        let app, auth, db, userId, userProfile = null;
+
+        // Application State
+        let state = {
+            view: 'customer_login', // customer_login, customer_panel, admin_panel, admin_customers
+            isLoading: true,
+            isAdminLoggedIn: false,
+            errorMessage: '',
+            successMessage: '',
+            availableSlots: [],
+            customers: [],
+            currentCustomer: null,
+            editingCustomer: null,
+            showTierChangeModal: false,
+            slotToConfirm: null,
+            slotToDelete: null,
+        };
+
+        // --- Utility Functions ---
+
+        /**
+         * Initializes Firebase, authenticates the user, and sets up real-time listeners.
+         */
+        const initializeFirebase = async () => {
+            try {
+                // 1. Initialize App
+                if (Object.keys(firebaseConfig).length === 0) {
+                    // This is the CRUCIAL point: database connection is skipped locally for stability
+                    state.errorMessage = "Database connection skipped. Please deploy with Firebase keys to enable data persistence.";
+                    state.isLoading = false;
+                    renderApp();
+                    return;
+                }
+                app = firebase.initializeApp(firebaseConfig);
+                db = firebase.getFirestore(app);
+                auth = firebase.getAuth(app);
+                
+                // Use debug logging
+                firebase.setLogLevel('Debug');
+
+                // 2. Authentication (Simplified for deployment readiness)
+                await new Promise((resolve) => {
+                    firebase.signInAnonymously(auth)
+                        .then(userCredential => {
+                            userId = userCredential.user.uid;
+                            resolve();
+                        })
+                        .catch(error => {
+                            console.error("Anonymous Authentication failed:", error);
+                            userId = crypto.randomUUID();
+                            resolve();
+                        });
+                });
+                
+                // 3. Set up Real-time Listeners
+                setupFirestoreListeners();
+
+            } catch (error) {
+                console.error("Firebase initialization failed:", error);
+                state.errorMessage = "Database initialization failed. Check console for details.";
+                state.isLoading = false;
+                renderApp();
+            }
+        };
+
+        /**
+         * Sets up listeners for slots and customers.
+         */
+        const setupFirestoreListeners = () => {
+            // 1. Slots Listener
+            const slotsRef = firebase.collection(db, `artifacts/${appId}/public/data/maintenance_slots`);
+            firebase.onSnapshot(slotsRef, (snapshot) => {
+                const slots = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+                state.availableSlots = slots;
+                state.isLoading = false;
+                renderApp();
+            }, (error) => {
+                console.error("Error fetching slots:", error);
+                state.errorMessage = "Error loading slots.";
+                state.isLoading = false;
+                renderApp();
+            });
+
+            // 2. Customers Listener (Admin View Data)
+            const customersRef = firebase.collection(db, `artifacts/${appId}/public/data/customers`);
+            firebase.onSnapshot(customersRef, (snapshot) => {
+                state.customers = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+                // If customer is logged in, ensure their profile is updated
+                if (state.currentCustomer) {
+                    const current = state.customers.find(c => c.accessCode === state.currentCustomer.accessCode);
+                    if (current) state.currentCustomer = current;
+                }
+                renderApp();
+            }, (error) => {
+                console.error("Error fetching customers:", error);
+                state.errorMessage = "Error loading customer data.";
+                renderApp();
+            });
+        };
+
+        /**
+         * Renders the entire application based on the current state.
+         */
+        const renderApp = () => {
+            const appContainer = document.getElementById('app-container');
+            if (!appContainer) return;
+
+            if (state.isLoading) {
+                appContainer.innerHTML = renderLoadingScreen();
+                return;
+            }
+
+            let contentHTML = '';
+
+            if (state.errorMessage) {
+                contentHTML = renderErrorScreen(state.errorMessage);
+            } else if (state.view === 'customer_login') {
+                contentHTML = renderCustomerLoginScreen();
+            } else if (state.view === 'customer_panel' && state.currentCustomer) {
+                contentHTML = renderCustomerPanel();
+            } else if (state.view === 'admin_panel' || state.view === 'admin_customers') {
+                contentHTML = renderAdminPanelWrapper();
+            } else {
+                // Fallback to login if state is inconsistent
+                state.view = 'customer_login';
+                contentHTML = renderCustomerLoginScreen();
+            }
+
+            appContainer.innerHTML = renderMainLayout(contentHTML);
+            attachEventListeners();
+            
+            // Update modal content after main layout render
+            if (state.slotToConfirm) updateBookingModalContent(); 
+        };
+
+        /**
+         * Renders the main header and layout wrapper.
+         */
+        const renderMainLayout = (content) => {
+            const tier = state.currentCustomer ? state.currentCustomer.tier : null;
+            const tierClass = tier === 'Gold' ? 'text-yellow-500' : tier === 'Silver' ? 'text-gray-400' : 'text-amber-700';
+            const adminButtonClass = state.isAdminLoggedIn ? 'bg-orange-600 hover:bg-orange-700' : 'bg-blue-600 hover:bg-blue-700';
+
+            const clientHeader = state.currentCustomer ? `
+                <div class="text-center mt-2">
+                    <p class="text-sm font-semibold ${tierClass}">${tier} Tier Member</p>
+                </div>
+            ` : '';
+
+            return `
+                <div class="min-h-screen bg-gray-50 flex flex-col">
+                    <header class="bg-indigo-700 text-white shadow-xl">
+                        <div class="max-w-7xl mx-auto py-4 px-4 sm:px-6 lg:px-8 flex justify-between items-center">
+                            <div class="flex flex-col">
+                                <h1 class="text-3xl font-extrabold tracking-tight">Lockers Property Maintenance</h1>
+                                ${clientHeader}
+                            </div>
+                            <div class="flex items-center space-x-3">
+                                ${state.currentCustomer ? `
+                                    <button id="logout-btn" class="text-sm px-3 py-1 bg-red-500 rounded-full hover:bg-red-600 transition duration-150 shadow-md">Logout</button>
+                                ` : ''}
+                                <button id="admin-login-trigger" class="text-sm px-4 py-2 ${adminButtonClass} rounded-xl transition duration-150 shadow-lg font-bold">
+                                    ${state.isAdminLoggedIn ? 'Admin Console' : 'Admin Login'}
+                                </button>
+                            </div>
+                        </div>
+                        ${state.isAdminLoggedIn ? renderAdminViewToggle() : ''}
+                    </header>
+                    <main class="flex-grow p-4 sm:p-6 lg:p-8">
+                        ${content}
+                    </main>
+                </div>
+                ${renderGlobalModals()}
+            `;
+        };
+
+        const renderAdminViewToggle = () => {
+            const baseClass = "px-4 py-2 font-semibold text-sm rounded-t-lg transition duration-150";
+            const activeClass = "bg-orange-500 text-white shadow-inner";
+            const inactiveClass = "bg-orange-400 text-orange-900 hover:bg-orange-600 hover:text-white";
+
+            return `
+                <div class="flex justify-center bg-orange-600 shadow-lg">
+                    <button id="admin-view-slots" class="${baseClass} ${state.view === 'admin_panel' ? activeClass : inactiveClass}">
+                        Slot Management
+                    </button>
+                    <button id="admin-view-customers" class="${baseClass} ${state.view === 'admin_customers' ? activeClass : inactiveClass}">
+                        Customer Access Management
+                    </button>
+                </div>
+            `;
+        };
+
+
+        // --- Screen Rendering Components ---
+
+        const renderLoadingScreen = () => `
+            <div class="flex justify-center items-center h-full min-h-[50vh]">
+                <div class="text-center">
+                    <svg class="animate-spin h-8 w-8 text-indigo-600 mx-auto" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
+                        <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
+                        <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+                    </svg>
+                    <p class="mt-2 text-indigo-600 font-semibold">Connecting to database...</p>
+                </div>
+            </div>
+        `;
+
+        const renderErrorScreen = (message) => `
+            <div class="bg-red-100 border-l-4 border-red-500 text-red-700 p-4 rounded-lg shadow-lg" role="alert">
+                <p class="font-bold">Error</p>
+                <p>${message}</p>
+                <button id="clear-error-btn" class="mt-2 text-sm text-red-600 underline">Clear Error</button>
+            </div>
+        `;
+
+        const renderCustomerLoginScreen = () => `
+            <div class="flex justify-center items-center min-h-[70vh]">
+                <div class="w-full max-w-md bg-white p-8 rounded-2xl shadow-2xl border-t-4 border-indigo-500">
+                    <h2 class="text-3xl font-bold text-indigo-700 mb-6 text-center">Client Access Required</h2>
+                    <p class="text-gray-600 mb-8 text-center">Please enter the Username and Access Code provided by Lockers Property Maintenance.</p>
+
+                    <div id="login-message" class="mb-4 text-center text-sm font-medium"></div>
+                    
+                    <form id="customer-login-form" class="space-y-6">
+                        <div>
+                            <label for="client-username" class="block text-sm font-medium text-gray-700">Username</label>
+                            <input type="text" id="client-username" name="client-username" required class="mt-1 block w-full px-4 py-2 border border-gray-300 rounded-xl shadow-sm focus:ring-indigo-500 focus:border-indigo-500">
+                        </div>
+                        <div>
+                            <label for="client-access-code" class="block text-sm font-medium text-gray-700">Access Code</label>
+                            <input type="text" id="client-access-code" name="client-access-code" required class="mt-1 block w-full px-4 py-2 border border-gray-300 rounded-xl shadow-sm focus:ring-indigo-500 focus:border-indigo-500">
+                        </div>
+                        
+                        <button type="button" id="client-login-trigger" class="w-full flex justify-center py-3 px-4 border border-transparent rounded-xl shadow-lg text-lg font-bold text-white bg-indigo-600 hover:bg-indigo-700 transition duration-200 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-indigo-500">
+                            Gain Access
+                        </button>
+                    </form>
+                </div>
+            </div>
+        `;
+
+        const renderCustomerPanel = () => {
+            if (!state.currentCustomer) return '<p class="text-center text-red-500 font-semibold">Error: Customer data not found. Please re-login.</p>';
+
+            // Filter out completed and past slots
+            const now = new Date();
+            const upcomingSlots = state.availableSlots
+                .filter(slot => slot.status !== 'completed' && slot.date && slot.time && new Date(slot.date + 'T' + slot.time + ':00Z') > now)
+                .sort((a, b) => (new Date(a.date + ' ' + a.time) - new Date(b.date + ' ' + b.time)));
+
+            const availableSlots = upcomingSlots.filter(slot => slot.status === 'available');
+            const userBookedSlots = upcomingSlots.filter(slot => slot.customerId === state.currentCustomer.id);
+
+            const renderSlotCard = (slot) => {
+                const dateTime = slot.date && slot.time ? new Date(slot.date + 'T' + slot.time + ':00Z') : null;
+                if (!dateTime) return ''; // Skip if date/time is invalid
+
+                const formattedDate = dateTime.toLocaleDateString('en-UK', { weekday: 'short', year: 'numeric', month: 'short', day: 'numeric' });
+                const formattedTime = dateTime.toLocaleTimeString('en-UK', { hour: '2-digit', minute: '2-digit', hour12: false, timeZone: 'UTC' }) + ' UTC';
+                
+                let statusClass, statusText, actionButton;
+
+                if (slot.status === 'available') {
+                    statusClass = 'border-l-8 border-green-500 bg-green-50';
+                    statusText = 'Available Slot';
+                    actionButton = `<button data-slot-id="${slot.id}" data-date="${slot.date}" data-time="${slot.time}" class="book-slot-btn px-4 py-2 bg-indigo-600 text-white font-semibold rounded-xl shadow-md hover:bg-indigo-700 transition duration-150">Book Now</button>`;
+                } else if (slot.status === 'requested') {
+                    statusClass = 'border-l-8 border-yellow-500 bg-yellow-50';
+                    statusText = 'Awaiting Admin Confirmation';
+                    actionButton = `<span class="text-sm font-semibold text-yellow-700">Request Sent</span>`;
+                } else if (slot.status === 'booked') {
+                    statusClass = 'border-l-8 border-blue-500 bg-blue-50';
+                    statusText = 'Booking Confirmed';
+                    actionButton = `<span class="text-sm font-semibold text-blue-700">Confirmed</span>`;
+                }
+                
+                return `
+                    <div class="${statusClass} p-4 rounded-xl shadow-lg flex justify-between items-center mb-4">
+                        <div>
+                            <p class="text-lg font-bold text-gray-800">${formattedDate}</p>
+                            <p class="text-sm text-gray-600">${formattedTime}</p>
+                            <p class="mt-1 text-xs font-semibold ${slot.status === 'booked' ? 'text-blue-700' : 'text-gray-500'}">${statusText}</p>
+                        </div>
+                        ${actionButton}
+                    </div>
+                `;
+            };
+
+            return `
+                <h2 class="text-3xl font-bold text-indigo-700 mb-6 border-b pb-2">Welcome, ${state.currentCustomer.name}</h2>
+                
+                ${userBookedSlots.length > 0 ? `
+                    <div class="mb-8">
+                        <h3 class="text-xl font-semibold text-gray-800 mb-4 flex items-center">Your Confirmed & Pending Bookings</h3>
+                        ${userBookedSlots.map(renderSlotCard).join('')}
+                    </div>
+                ` : ''}
+
+                <div class="mb-8">
+                    <h3 class="text-xl font-semibold text-gray-800 mb-4 flex items-center">Available Maintenance Slots</h3>
+                    ${availableSlots.length > 0 ? `
+                        <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+                            ${availableSlots.map(renderSlotCard).join('')}
+                        </div>
+                    ` : `
+                        <div class="bg-gray-100 p-6 rounded-xl text-center text-gray-600 shadow-inner">
+                            <p class="font-semibold">No available slots at the moment. Please check back later.</p>
+                        </div>
+                    `}
+                </div>
+            `;
+        };
+
+
+        const renderAdminPanelWrapper = () => {
+            // Determine which tab to show
+            return state.view === 'admin_panel' ? renderAdminSlotManagement() : renderAdminCustomerManagement();
+        };
+
+        const renderAdminSlotManagement = () => {
+            const now = new Date();
+            const futureSlots = state.availableSlots
+                .filter(slot => slot.status !== 'completed' && slot.date && slot.time && new Date(slot.date + 'T' + slot.time + ':00Z') > now)
+                .sort((a, b) => (new Date(a.date + ' ' + a.time) - new Date(b.date + ' ' + b.time)));
+
+            const upcomingRequests = futureSlots.filter(slot => slot.status !== 'available');
+            const futureAvailability = futureSlots.filter(slot => slot.status === 'available');
+
+            const getCustomerInfo = (customerId) => {
+                const customer = state.customers.find(c => c.id === customerId);
+                // Defensive check: If customer is not found, return a default string
+                return customer ? `${customer.name || 'N/A'} (${customer.username || 'N/A'}) - ${customer.address || 'N/A'}` : 'Customer Info Unavailable';
+            };
+
+            const renderSlotCard = (slot) => {
+                // Defensive check for date and time fields
+                const dateTime = slot.date && slot.time ? new Date(slot.date + 'T' + slot.time + ':00Z') : null;
+                if (!dateTime) return ''; // Skip if date/time is invalid
+
+                const formattedDate = dateTime.toLocaleDateString('en-UK', { weekday: 'short', year: 'numeric', month: 'short', day: 'numeric' });
+                const formattedTime = dateTime.toLocaleTimeString('en-UK', { hour: '2-digit', minute: '2-digit', hour12: false, timeZone: 'UTC' }) + ' UTC';
+                
+                let statusClass, statusText, actionButtons, details;
+
+                if (slot.status === 'available') {
+                    statusClass = 'border-l-8 border-green-500 bg-white';
+                    statusText = 'Available for Booking';
+                    details = `<p class="text-sm text-gray-500 mt-2">Ready for a customer to book.</p>`;
+                    actionButtons = `<button data-id="${slot.id}" class="delete-slot-btn px-4 py-2 bg-red-500 text-white font-semibold rounded-xl shadow-md hover:bg-red-600 transition duration-150">Delete Slot</button>`;
+                } else if (slot.status === 'requested') {
+                    statusClass = 'border-l-8 border-amber-500 bg-amber-50';
+                    statusText = 'NEW REQUEST PENDING APPROVAL';
+                    details = `
+                        <p class="text-sm font-semibold text-gray-800">Customer: ${getCustomerInfo(slot.customerId)}</p>
+                        <p class="text-sm text-gray-600">Details: ${slot.details || 'No details provided.'}</p>
+                        <p class="text-xs text-red-600 font-medium mt-1">Status: Customer is awaiting confirmation.</p>
+                    `;
+                    actionButtons = `
+                        <button data-id="${slot.id}" class="accept-request-btn px-4 py-2 bg-indigo-600 text-white font-semibold rounded-xl shadow-md hover:bg-indigo-700 transition duration-150 mr-2">Accept Request</button>
+                        <button data-id="${slot.id}" class="delete-slot-btn px-4 py-2 bg-red-500 text-white font-semibold rounded-xl shadow-md hover:bg-red-600 transition duration-150">Delete Slot</button>
+                    `;
+                } else if (slot.status === 'booked') {
+                    statusClass = 'border-l-8 border-blue-500 bg-blue-50';
+                    statusText = 'JOB CONFIRMED & SCHEDULED';
+                    details = `
+                        <p class="text-sm font-semibold text-gray-800">Customer: ${getCustomerInfo(slot.customerId)}</p>
+                        <p class="text-sm text-gray-600">Details: ${slot.details || 'No details provided.'}</p>
+                        <p class="text-xs text-blue-600 font-medium mt-1">Status: Job is confirmed for this time.</p>
+                    `;
+                    actionButtons = `
+                        <button data-id="${slot.id}" class="mark-completed-btn px-4 py-2 bg-green-600 text-white font-semibold rounded-xl shadow-md hover:bg-green-700 transition duration-150">Mark Job Completed</button>
+                    `;
+                }
+
+                return `
+                    <div class="${statusClass} p-4 rounded-xl shadow-lg flex flex-col mb-4">
+                        <div class="flex justify-between items-start">
+                            <div>
+                                <p class="text-xl font-extrabold text-gray-900">${formattedDate}</p>
+                                <p class="text-md font-semibold text-gray-600">${formattedTime}</p>
+                                <p class="text-xs font-bold mt-1 text-indigo-700">${statusText}</p>
+                            </div>
+                        </div>
+                        <div class="mt-3">
+                            ${details}
+                        </div>
+                        <div class="mt-4 pt-3 border-t border-gray-200 flex justify-end">
+                            ${actionButtons}
+                        </div>
+                    </div>
+                `;
+            };
+
+            return `
+                <div class="max-w-4xl mx-auto">
+                    <h2 class="text-3xl font-bold text-orange-700 mb-6 border-b pb-2">Maintenance Slot Management</h2>
+
+                    <!-- Add New Slot Form -->
+                    <div class="bg-white p-6 rounded-2xl shadow-xl mb-8 border-t-4 border-orange-500">
+                        <h3 class="text-xl font-bold text-gray-800 mb-4">Add New Available Slot</h3>
+                        <div id="slot-message" class="mb-4 text-sm font-medium"></div>
+
+                        <form id="add-slot-form" class="space-y-4">
+                            <div class="grid grid-cols-2 gap-4">
+                                <div>
+                                    <label for="slot-date" class="block text-sm font-medium text-gray-700">Date (YYYY-MM-DD)</label>
+                                    <input type="date" id="slot-date" required class="mt-1 block w-full px-3 py-2 border border-gray-300 rounded-xl shadow-sm focus:ring-orange-500 focus:border-orange-500">
+                                </div>
+                                <div>
+                                    <label for="slot-time" class="block text-sm font-medium text-gray-700">Time (UTC)</label>
+                                    <input type="time" id="slot-time" required class="mt-1 block w-full px-3 py-2 border border-gray-300 rounded-xl shadow-sm focus:ring-orange-500 focus:border-orange-500">
+                                </div>
+                            </div>
+                            <button type="submit" class="w-full py-3 px-4 rounded-xl shadow-lg text-lg font-bold text-white bg-orange-600 hover:bg-orange-700 transition duration-200">
+                                Schedule New Availability
+                            </button>
+                        </form>
+                    </div>
+
+                    <!-- Upcoming Requests & Slots List -->
+                    <div class="mb-8">
+                        <h3 class="text-2xl font-bold text-gray-800 mb-4">Upcoming Requests & Slots (${upcomingRequests.length})</h3>
+                        ${upcomingRequests.length > 0 ? `
+                            ${upcomingRequests.map(renderSlotCard).join('')}
+                        ` : `
+                            <p class="text-gray-500 italic">No pending requests or confirmed bookings.</p>
+                        `}
+                    </div>
+                    
+                    <!-- Future Availability List -->
+                    <div>
+                        <h3 class="text-2xl font-bold text-gray-800 mb-4">Future Availability (${futureAvailability.length})</h3>
+                        ${futureAvailability.length > 0 ? `
+                            ${futureAvailability.map(renderSlotCard).join('')}
+                        ` : `
+                            <p class="text-gray-500 italic">No future slots currently added.</p>
+                        `}
+                    </div>
+                </div>
+            `;
+        };
+
+        const renderAdminCustomerManagement = () => {
+            const renderCustomerCard = (customer) => {
+                const tiers = {
+                    Bronze: { color: 'bg-amber-700', text: 'text-white' },
+                    Silver: { color: 'bg-gray-400', text: 'text-gray-800' },
+                    Gold: { color: 'bg-yellow-500', text: 'text-gray-900' },
+                };
+                const tierInfo = tiers[customer.tier] || { color: 'bg-gray-200', text: 'text-gray-700' };
+
+                // Defensive check for validUntil field
+                const validUntilDate = customer.validUntil && customer.validUntil.toDate ? customer.validUntil.toDate() : null;
+                const isExpired = validUntilDate && validUntilDate < new Date();
+                const statusClass = isExpired ? 'bg-red-50 border-red-500' : 'bg-green-50 border-green-500';
+
+                const counts = customer.bookingCounts || {};
+                const currentYear = new Date().getFullYear().toString();
+                const currentMonth = new Date().toISOString().substring(0, 7);
+
+                // Defensive check for address and name
+                const customerName = customer.name || 'N/A';
+                const customerAddress = customer.address || 'N/A';
+                
+                // Defensive checks for nested count data
+                const monthlyCount = counts.monthly ? (counts.monthly[currentMonth] || 0) : 0;
+                const yearlyCount = counts.yearly ? (counts.yearly[currentYear] || 0) : 0;
+                const totalCount = counts.total || 0;
+
+
+                return `
+                    <div class="${statusClass} border-l-8 p-4 rounded-xl shadow-lg flex flex-col mb-4">
+                        <div class="flex justify-between items-start pb-2 border-b border-gray-200">
+                            <div>
+                                <h4 class="text-xl font-bold text-gray-900">${customerName}</h4>
+                                <p class="text-sm font-semibold text-gray-600">User: ${customer.username || 'N/A'} | Code: ${customer.accessCode || 'N/A'}</p>
+                            </div>
+                            <span class="px-3 py-1 text-sm font-bold rounded-full shadow ${tierInfo.color} ${tierInfo.text}">${customer.tier || 'N/A'} Tier</span>
+                        </div>
+                        
+                        <div class="mt-3 text-sm">
+                            <p class="text-gray-700 font-medium">Address: ${customerAddress}</p>
+                            <p class="mt-1 font-medium">Access Status: 
+                                ${isExpired ? 
+                                    `<span class="text-red-600 font-bold">EXPIRED (${validUntilDate ? validUntilDate.toLocaleDateString('en-UK') : 'N/A'})</span>` : 
+                                    `<span class="text-green-600 font-bold">ACTIVE (Valid Until ${validUntilDate ? validUntilDate.toLocaleDateString('en-UK') : 'N/A'})</span>`}
+                            </p>
+                        </div>
+
+                        <div class="mt-4 pt-3 border-t border-gray-200 grid grid-cols-3 gap-4 text-center">
+                            <div>
+                                <p class="text-xs text-gray-500">Bookings This Month</p>
+                                <p class="font-bold text-lg text-indigo-600">${monthlyCount}</p>
+                            </div>
+                            <div>
+                                <p class="text-xs text-gray-500">Bookings This Year</p>
+                                <p class="font-bold text-lg text-indigo-600">${yearlyCount}</p>
+                            </div>
+                            <div>
+                                <p class="text-xs text-gray-500">Total Lifetime Bookings</p>
+                                <p class="font-bold text-lg text-indigo-600">${totalCount}</p>
+                            </div>
+                        </div>
+
+                        <div class="mt-4 flex justify-end space-x-2 pt-3 border-t border-gray-200">
+                            <button data-id="${customer.id}" data-tier="${customer.tier}" class="change-tier-btn px-4 py-2 bg-indigo-600 text-white font-semibold rounded-xl shadow-md hover:bg-indigo-700 transition duration-150">Change Tier</button>
+                            ${isExpired ? `
+                                <button data-id="${customer.id}" class="renew-customer-btn px-4 py-2 bg-blue-600 text-white font-semibold rounded-xl shadow-md hover:bg-blue-700 transition duration-150">Renew (1 Yr)</button>
+                            ` : ''}
+                        </div>
+                    </div>
+                `;
+            };
+
+            const tiers = ['Bronze', 'Silver', 'Gold'];
+
+            return `
+                <div class="max-w-4xl mx-auto">
+                    <h2 class="text-3xl font-bold text-orange-700 mb-6 border-b pb-2">Customer Access Management (Annual)</h2>
+
+                    <!-- Add New Customer Form -->
+                    <div class="bg-white p-6 rounded-2xl shadow-xl mb-8 border-t-4 border-orange-500">
+                        <h3 class="text-xl font-bold text-gray-800 mb-4">Add New Annual Customer</h3>
+                        <div id="customer-message" class="mb-4 text-sm font-medium"></div>
+
+                        <form id="add-customer-form" class="space-y-4">
+                            <div>
+                                <label for="customer-name" class="block text-sm font-medium text-gray-700">Full Name</label>
+                                <input type="text" id="customer-name" required class="mt-1 block w-full px-3 py-2 border border-gray-300 rounded-xl shadow-sm focus:ring-orange-500 focus:border-orange-500">
+                            </div>
+                            <div class="grid grid-cols-2 gap-4">
+                                <div>
+                                    <label for="customer-username" class="block text-sm font-medium text-gray-700">Username</label>
+                                    <input type="text" id="customer-username" required class="mt-1 block w-full px-3 py-2 border border-gray-300 rounded-xl shadow-sm focus:ring-orange-500 focus:border-orange-500">
+                                </div>
+                                <div>
+                                    <label for="customer-code" class="block text-sm font-medium text-gray-700">Access Code</label>
+                                    <input type="text" id="customer-code" required class="mt-1 block w-full px-3 py-2 border border-gray-300 rounded-xl shadow-sm focus:ring-orange-500 focus:border-orange-500">
+                                </div>
+                            </div>
+                            <div>
+                                <label for="customer-address" class="block text-sm font-medium text-gray-700">Property Address</label>
+                                <input type="text" id="customer-address" required class="mt-1 block w-full px-3 py-2 border border-gray-300 rounded-xl shadow-sm focus:ring-orange-500 focus:border-orange-500">
+                            </div>
+                            <div>
+                                <label for="customer-tier" class="block text-sm font-medium text-gray-700">Membership Tier</label>
+                                <select id="customer-tier" required class="mt-1 block w-full px-3 py-2 border border-gray-300 rounded-xl shadow-sm focus:ring-orange-500 focus:border-orange-500 bg-white">
+                                    ${tiers.map(t => `<option value="${t}">${t}</option>`).join('')}
+                                </select>
+                            </div>
+
+                            <button type="submit" class="w-full py-3 px-4 rounded-xl shadow-lg text-lg font-bold text-white bg-orange-600 hover:bg-orange-700 transition duration-200">
+                                Add Customer (Valid for 1 Year)
+                            </button>
+                        </form>
+                    </div>
+
+                    <!-- Customer List -->
+                    <div>
+                        <h3 class="text-2xl font-bold text-gray-800 mb-4">Active & Expired Customers (${state.customers.length})</h3>
+                        ${state.customers.length > 0 ? `
+                            ${state.customers.map(renderCustomerCard).join('')}
+                        ` : `
+                            <p class="text-gray-500 italic">No customers found in the database.</p>
+                        `}
+                    </div>
+                </div>
+            `;
+        };
+
+        // --- Modals ---
+
+        const renderAdminLoginModal = () => `
+            <div id="admin-modal" class="hidden fixed inset-0 bg-gray-900 bg-opacity-75 flex items-center justify-center p-4 z-50">
+                <div class="bg-white p-8 rounded-xl shadow-2xl w-full max-w-sm">
+                    <h3 class="text-2xl font-bold text-indigo-700 mb-4 text-center">Admin Access</h3>
+                    <p class="text-sm text-gray-600 mb-6 text-center">Enter the secret code to access the console.</p>
+                    
+                    <div id="admin-login-message" class="mb-4 text-sm font-medium text-center"></div>
+
+                    <form id="admin-login-form" class="space-y-4">
+                        <input type="password" id="admin-secret-code" placeholder="Secret Code" required class="w-full px-4 py-2 border border-gray-300 rounded-xl shadow-sm focus:ring-indigo-500 focus:border-indigo-500">
+                        <button type="submit" class="w-full py-2 px-4 rounded-xl shadow-lg text-lg font-bold text-white bg-orange-600 hover:bg-orange-700 transition duration-200">
+                            Log In
+                        </button>
+                    </form>
+                    <button id="close-admin-modal" class="w-full mt-3 text-sm text-gray-500 hover:text-gray-700">Cancel</button>
+                </div>
+            </div>
+        `;
+
+        const renderBookingModal = () => {
+            // Note: Render logic is simpler here, modal content is updated dynamically via renderApp()
+            return `
+                <div id="booking-modal" class="hidden fixed inset-0 bg-gray-900 bg-opacity-75 flex items-center justify-center p-4 z-50">
+                    <div class="bg-white p-8 rounded-xl shadow-2xl w-full max-w-lg border-t-4 border-indigo-500">
+                        <h3 class="text-2xl font-bold text-indigo-700 mb-4">Confirm Maintenance Booking</h3>
+                        <p class="text-gray-600 mb-6">You are requesting a slot for:</p>
+                        
+                        <div id="booking-details-display" class="bg-indigo-50 p-4 rounded-xl mb-6">
+                            <!-- Dynamic details inserted here -->
+                        </div>
+                        
+                        <div id="booking-modal-message" class="mb-4 text-sm font-medium"></div>
+
+                        <form id="confirm-booking-form" class="space-y-4">
+                            <div>
+                                <label for="booking-name" class="block text-sm font-medium text-gray-700">Your Full Name</label>
+                                <input type="text" id="booking-name" required value="${state.currentCustomer ? state.currentCustomer.name : ''}" class="mt-1 block w-full px-4 py-2 border border-gray-300 rounded-xl shadow-sm focus:ring-indigo-500 focus:border-indigo-500">
+                            </div>
+                            <div>
+                                <label for="booking-details" class="block text-sm font-medium text-gray-700">Maintenance Request Details (e.g., Leaking tap, boiler service)</label>
+                                <textarea id="booking-details" required rows="3" placeholder="Describe the issue here..." class="mt-1 block w-full px-4 py-2 border border-gray-300 rounded-xl shadow-sm focus:ring-indigo-500 focus:border-indigo-500"></textarea>
+                            </div>
+
+                            <div class="flex justify-end space-x-3 pt-4">
+                                <button type="button" id="cancel-booking-btn" class="px-4 py-2 text-gray-700 font-semibold rounded-xl hover:bg-gray-100 transition duration-150">Cancel</button>
+                                <button type="button" id="confirm-booking-trigger" class="px-6 py-2 rounded-xl shadow-lg text-lg font-bold text-white bg-indigo-600 hover:bg-indigo-700 transition duration-200">
+                                    Confirm Booking
+                                </button>
+                            </div>
+                        </form>
+                    </div>
+                </div>
+            `;
+        };
+
+        // Function to update the booking modal content when slotToConfirm is set
+        const updateBookingModalContent = () => {
+            if (!state.slotToConfirm) return;
+            const { date, time } = state.slotToConfirm;
+            const dateTime = date && time ? new Date(date + 'T' + time + ':00Z') : null;
+            
+            if (!dateTime) return;
+
+            const formattedDate = dateTime.toLocaleDateString('en-UK', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' });
+            const formattedTime = dateTime.toLocaleTimeString('en-UK', { hour: '2-digit', minute: '2-digit', hour12: false, timeZone: 'UTC' }) + ' UTC';
+
+            const detailsDisplay = document.getElementById('booking-details-display');
+            if (detailsDisplay) {
+                detailsDisplay.innerHTML = `
+                    <p class="text-lg font-bold text-indigo-800">${formattedDate}</p>
+                    <p class="text-md font-semibold text-indigo-600">${formattedTime}</p>
+                    <p class="text-sm mt-2 text-indigo-700">Property Address: <span class="font-bold">${state.currentCustomer ? state.currentCustomer.address : 'Loading...'}</span></p>
+                `;
+            }
+            
+            const nameInput = document.getElementById('booking-name');
+            if (nameInput && state.currentCustomer) {
+                nameInput.value = state.currentCustomer.name || '';
+            }
+        };
+
+        const renderTierChangeModal = () => {
+            if (!state.editingCustomer) return '';
+
+            const tiers = ['Bronze', 'Silver', 'Gold'];
+            const currentTier = state.editingCustomer.tier || 'Bronze'; // Default to Bronze if missing
+
+            return `
+                <div id="tier-change-modal" class="${state.showTierChangeModal ? '' : 'hidden'} fixed inset-0 bg-gray-900 bg-opacity-75 flex items-center justify-center p-4 z-50">
+                    <div class="bg-white p-8 rounded-xl shadow-2xl w-full max-w-md border-t-4 border-indigo-500">
+                        <h3 class="text-2xl font-bold text-indigo-700 mb-4">Change Tier for ${state.editingCustomer.name || 'Customer'}</h3>
+                        <p class="text-gray-600 mb-6">Current Tier: <span class="font-bold">${currentTier}</span></p>
+
+                        <div id="tier-change-message" class="mb-4 text-sm font-medium text-center"></div>
+                        
+                        <form id="tier-change-form" class="space-y-4">
+                            <div>
+                                <label for="new-tier" class="block text-sm font-medium text-gray-700">Select New Membership Tier</label>
+                                <select id="new-tier" required class="mt-1 block w-full px-4 py-2 border border-gray-300 rounded-xl shadow-sm focus:ring-indigo-500 focus:border-indigo-500 bg-white">
+                                    ${tiers.map(t => `<option value="${t}" ${t === currentTier ? 'selected' : ''}>${t}</option>`).join('')}
+                                </select>
+                            </div>
+                            
+                            <div class="bg-yellow-50 p-3 rounded-lg text-sm text-yellow-800">
+                                <p class="font-bold">Renewal Policy:</p>
+                                <p>Downgrading (<span class="font-bold">e.g., Gold &rarr; Silver</span>) will automatically renew annual access.</p>
+                                <p>Upgrading (<span class="font-bold">e.g., Bronze &rarr; Gold</span>) will NOT renew the access date.</p>
+                            </div>
+
+                            <div class="flex justify-end space-x-3 pt-4">
+                                <button type="button" id="cancel-tier-change-btn" class="px-4 py-2 text-gray-700 font-semibold rounded-xl hover:bg-gray-100 transition duration-150">Cancel</button>
+                                <button type="submit" class="px-6 py-2 rounded-xl shadow-lg text-lg font-bold text-white bg-indigo-600 hover:bg-indigo-700 transition duration-200">
+                                    Confirm Tier Change
+                                </button>
+                            </div>
+                        </form>
+                    </div>
+                </div>
+            `;
+        };
+
+
+        // Inject Modals into the DOM once at startup
+        const renderGlobalModals = () => {
+            // This is run once, subsequent state changes show/hide these elements
+            return renderAdminLoginModal() + renderBookingModal() + renderTierChangeModal();
+        };
+
+        const attachInitialModalListeners = () => {
+            // Admin Modal Listeners
+            document.getElementById('admin-modal').onclick = (e) => {
+                if (e.target.id === 'admin-modal' || e.target.id === 'close-admin-modal') {
+                    hideModal('admin-modal');
+                }
+            };
+            
+            // Tier Change Modal Listeners (Must be attached once)
+            const cancelTierChangeBtn = document.getElementById('cancel-tier-change-btn');
+            if (cancelTierChangeBtn) {
+                cancelTierChangeBtn.onclick = () => {
+                    state.showTierChangeModal = false;
+                    state.editingCustomer = null;
+                    renderApp();
+                    hideModal('tier-change-modal');
+                };
+            }
+        };
+
+        // --- Event Listeners and Handlers ---
+
+        /**
+         * Attaches all dynamic event listeners. Uses event delegation where necessary.
+         */
+        const attachEventListeners = () => {
+            // 1. GLOBAL ADMIN LOGIN BUTTON (Permanent Element)
+            const adminTrigger = document.getElementById('admin-login-trigger');
+            if (adminTrigger) {
+                adminTrigger.onclick = () => showModal('admin-modal');
+            }
+
+            // 2. Clear Error Button
+            const clearErrorBtn = document.getElementById('clear-error-btn');
+            if (clearErrorBtn) {
+                clearErrorBtn.onclick = () => { state.errorMessage = ''; renderApp(); };
+            }
+
+            // 3. Admin Login Form Submission
+            const adminLoginForm = document.getElementById('admin-login-form');
+            if (adminLoginForm) {
+                adminLoginForm.onsubmit = (e) => {
+                    e.preventDefault();
+                    handleAdminLogin(document.getElementById('admin-secret-code').value);
+                };
+            }
+            
+            // 4. Logout Button
+            const logoutBtn = document.getElementById('logout-btn');
+            if (logoutBtn) {
+                logoutBtn.onclick = handleLogout;
+            }
+
+            // 5. Customer Login Form Submission (Guaranteed Fix)
+            const clientLoginTrigger = document.getElementById('client-login-trigger');
+            if (clientLoginTrigger) {
+                clientLoginTrigger.onclick = () => {
+                    handleCustomerLogin(
+                        document.getElementById('client-username').value,
+                        document.getElementById('client-access-code').value
+                    );
+                };
+            }
+
+            // 6. Admin Panel View Toggles
+            const adminSlotsBtn = document.getElementById('admin-view-slots');
+            if (adminSlotsBtn) {
+                adminSlotsBtn.onclick = () => { state.view = 'admin_panel'; renderApp(); };
+            }
+            const adminCustomersBtn = document.getElementById('admin-view-customers');
+            if (adminCustomersBtn) {
+                adminCustomersBtn.onclick = () => { state.view = 'admin_customers'; renderApp(); };
+            }
+
+
+            // 7. Dynamic Admin Panel Listeners (Event Delegation for reliability)
+            const appContainer = document.getElementById('app-container');
+            if (appContainer) {
+                appContainer.onclick = (e) => {
+                    const btn = e.target.closest('button');
+                    if (!btn) return;
+
+                    const slotId = btn.getAttribute('data-id');
+                    const customerId = btn.getAttribute('data-id');
+
+                    if (btn.classList.contains('accept-request-btn')) {
+                        handleAcceptRequest(slotId);
+                    } else if (btn.classList.contains('delete-slot-btn')) {
+                        handleDeleteSlot(slotId);
+                    } else if (btn.classList.contains('mark-completed-btn')) {
+                        handleMarkCompleted(slotId);
+                    } else if (btn.classList.contains('renew-customer-btn')) {
+                        handleRenewCustomer(customerId);
+                    } else if (btn.classList.contains('change-tier-btn')) {
+                        const customer = state.customers.find(c => c.id === customerId);
+                        if (customer) {
+                            state.editingCustomer = customer;
+                            state.showTierChangeModal = true;
+                            renderApp(); // Rerender to show modal content
+                            showModal('tier-change-modal');
+                        }
+                    } else if (btn.classList.contains('book-slot-btn')) {
+                        // 9. Customer Panel Book Now Listeners
+                        state.slotToConfirm = {
+                            id: btn.getAttribute('data-slot-id'),
+                            date: btn.getAttribute('data-date'),
+                            time: btn.getAttribute('data-time'),
+                        };
+                        // Must update content before showing modal
+                        renderApp(); 
+                        updateBookingModalContent();
+                        showModal('booking-modal');
+                    }
+                };
+            }
+
+            // 8. Slot/Customer Form Submissions
+            const addSlotForm = document.getElementById('add-slot-form');
+            if (addSlotForm) {
+                addSlotForm.onsubmit = (e) => {
+                    e.preventDefault();
+                    handleAddSlot(document.getElementById('slot-date').value, document.getElementById('slot-time').value);
+                };
+            }
+
+            const addCustomerForm = document.getElementById('add-customer-form');
+            if (addCustomerForm) {
+                addCustomerForm.onsubmit = (e) => {
+                    e.preventDefault();
+                    handleAddCustomer(
+                        document.getElementById('customer-name').value,
+                        document.getElementById('customer-username').value,
+                        document.getElementById('customer-code').value,
+                        document.getElementById('customer-address').value,
+                        document.getElementById('customer-tier').value
+                    );
+                };
+            }
+
+            // 10. Booking Modal Listeners
+            const cancelBookingBtn = document.getElementById('cancel-booking-btn');
+            if (cancelBookingBtn) {
+                cancelBookingBtn.onclick = () => {
+                    state.slotToConfirm = null;
+                    renderApp();
+                    hideModal('booking-modal');
+                };
+            }
+
+            const confirmBookingTrigger = document.getElementById('confirm-booking-trigger');
+            if (confirmBookingTrigger) {
+                confirmBookingTrigger.onclick = () => {
+                    handleConfirmBooking(
+                        document.getElementById('booking-name').value,
+                        document.getElementById('booking-details').value
+                    );
+                };
+            }
+
+            // 11. Tier Change Modal Listeners
+            const tierChangeForm = document.getElementById('tier-change-form');
+            if (tierChangeForm) {
+                tierChangeForm.onsubmit = (e) => {
+                    e.preventDefault();
+                    handleTierChange(document.getElementById('new-tier').value);
+                };
+            }
+        };
+
+        const showModal = (id) => {
+            const modal = document.getElementById(id);
+            if (modal) modal.classList.remove('hidden');
+        };
+
+        const hideModal = (id) => {
+            const modal = document.getElementById(id);
+            if (modal) modal.classList.add('hidden');
+        };
+
+
+        // --- Core Logic Handlers ---
+
+        const handleAdminLogin = (code) => {
+            const secretCode = '258456258456Aa!!';
+            const messageElement = document.getElementById('admin-login-message');
+            messageElement.textContent = '';
+
+            if (code === secretCode) {
+                state.isAdminLoggedIn = true;
+                state.view = 'admin_panel';
+                hideModal('admin-modal');
+                renderApp();
+            } else {
+                messageElement.innerHTML = `<span class="text-red-600">Invalid secret code.</span>`;
+            }
+        };
+
+        const handleCustomerLogin = (username, code) => {
+            const messageElement = document.getElementById('login-message');
+            messageElement.textContent = '';
+
+            const customer = state.customers.find(c => c.username === username && c.accessCode === code);
+
+            if (customer) {
+                // Defensive check for validUntil field
+                const validUntilDate = customer.validUntil && customer.validUntil.toDate ? customer.validUntil.toDate() : null;
+                const isExpired = validUntilDate && validUntilDate < new Date();
+
+                if (isExpired) {
+                    messageElement.innerHTML = `<span class="text-red-600 font-bold">Access Expired.</span> Please contact Lockers Property Maintenance for renewal.`;
+                } else {
+                    state.currentCustomer = customer;
+                    state.view = 'customer_panel';
+                    renderApp();
+                }
+            } else {
+                messageElement.innerHTML = `<span class="text-red-600 font-bold">Invalid Username or Access Code.</span>`;
+            }
+        };
+
+        const handleLogout = () => {
+            state.currentCustomer = null;
+            state.isAdminLoggedIn = false;
+            state.view = 'customer_login';
+            renderApp();
+        };
+
+        // Admin Handlers
+
+        const handleAddSlot = async (date, time) => {
+            const messageElement = document.getElementById('slot-message');
+            messageElement.textContent = '';
+
+            const slotDateTime = new Date(date + 'T' + time + ':00Z');
+            const now = new Date();
+
+            if (slotDateTime <= now) {
+                messageElement.innerHTML = `<span class="text-red-600">Error: Slot must be in the future.</span>`;
+                return;
+            }
+
+            try {
+                const slotsRef = firebase.collection(db, `artifacts/${appId}/public/data/maintenance_slots`);
+                await firebase.addDoc(slotsRef, {
+                    date: date,
+                    time: time,
+                    status: 'available',
+                    createdAt: firebase.serverTimestamp(),
+                });
+                messageElement.innerHTML = `<span class="text-green-600">Availability scheduled successfully.</span>`;
+                document.getElementById('add-slot-form').reset();
+            } catch (e) {
+                console.error("Error adding document: ", e);
+                messageElement.innerHTML = `<span class="text-red-600">Error: Failed to schedule slot.</span>`;
+            }
+        };
+
+        const handleAddCustomer = async (name, username, code, address, tier) => {
+            const messageElement = document.getElementById('customer-message');
+            messageElement.textContent = '';
+
+            // Check for existing username or code
+            const exists = state.customers.some(c => c.username === username || c.accessCode === code);
+            if (exists) {
+                messageElement.innerHTML = `<span class="text-red-600">Error: Username or Access Code already exists.</span>`;
+                return;
+            }
+
+            const validUntil = new Date();
+            validUntil.setFullYear(validUntil.getFullYear() + 1);
+
+            try {
+                const customersRef = firebase.collection(db, `artifacts/${appId}/public/data/customers`);
+                await firebase.addDoc(customersRef, {
+                    name,
+                    username,
+                    accessCode: code,
+                    address,
+                    tier,
+                    validUntil: firebase.Timestamp.fromDate(validUntil),
+                    bookingCounts: { total: 0, monthly: {}, yearly: {} },
+                    createdAt: firebase.serverTimestamp(),
+                });
+                messageElement.innerHTML = `<span class="text-green-600">Customer added successfully (Valid until ${validUntil.toLocaleDateString('en-UK')}).</span>`;
+                document.getElementById('add-customer-form').reset();
+            } catch (e) {
+                console.error("Error adding customer: ", e);
+                messageElement.innerHTML = `<span class="text-red-600">Error: Failed to add customer.</span>`;
+            }
+        };
+
+        const handleRenewCustomer = async (customerId) => {
+            // Use prompt instead of confirm for robustness in this environment
+            const response = prompt('Are you sure you want to renew this customer\'s access for 1 year? Type YES to confirm.');
+            if (response !== 'YES') return;
+
+            try {
+                const docRef = firebase.doc(db, `artifacts/${appId}/public/data/customers`, customerId);
+                const validUntil = new Date();
+                validUntil.setFullYear(validUntil.getFullYear() + 1);
+
+                await firebase.updateDoc(docRef, {
+                    validUntil: firebase.Timestamp.fromDate(validUntil),
+                });
+                state.successMessage = `Customer access renewed until ${validUntil.toLocaleDateString('en-UK')}.`;
+            } catch (e) {
+                console.error("Error renewing customer: ", e);
+                state.errorMessage = "Failed to renew customer access.";
+            } finally {
+                renderApp();
+            }
+        };
+
+        const handleTierChange = async (newTier) => {
+            if (!state.editingCustomer) return;
+
+            const oldTier = state.editingCustomer.tier;
+            const isDowngrade = (oldTier === 'Gold' && (newTier === 'Silver' || newTier === 'Bronze')) ||
+                                (oldTier === 'Silver' && newTier === 'Bronze');
+            
+            let renewalUpdate = {};
+            if (isDowngrade) {
+                const validUntil = new Date();
+                validUntil.setFullYear(validUntil.getFullYear() + 1);
+                renewalUpdate.validUntil = firebase.Timestamp.fromDate(validUntil);
+                state.successMessage = `Tier changed to ${newTier} and access renewed due to downgrade.`;
+            } else {
+                state.successMessage = `Tier changed to ${newTier}. Access date remains the same.`;
+            }
+
+            try {
+                const docRef = firebase.doc(db, `artifacts/${appId}/public/data/customers`, state.editingCustomer.id);
+                await firebase.updateDoc(docRef, {
+                    tier: newTier,
+                    ...renewalUpdate,
+                });
+            } catch (e) {
+                console.error("Error changing tier: ", e);
+                state.errorMessage = "Failed to update membership tier.";
+            } finally {
+                state.showTierChangeModal = false;
+                state.editingCustomer = null;
+                renderApp();
+                hideModal('tier-change-modal');
+            }
+        };
+
+
+        const handleAcceptRequest = async (slotId) => {
+            const response = prompt('Are you sure you want to accept this request and confirm the booking? Type YES to confirm.');
+            if (response !== 'YES') return;
+
+            try {
+                const docRef = firebase.doc(db, `artifacts/${appId}/public/data/maintenance_slots`, slotId);
+                await firebase.updateDoc(docRef, {
+                    status: 'booked',
+                });
+                state.successMessage = "Request accepted and booking confirmed!";
+            } catch (e) {
+                console.error("Error accepting request: ", e);
+                state.errorMessage = "Failed to accept booking request.";
+            } finally {
+                renderApp();
+            }
+        };
+
+        const handleMarkCompleted = async (slotId) => {
+            const response = prompt('Are you sure you want to mark this job as completed and archive the slot? Type YES to confirm.');
+            if (response !== 'YES') return;
+
+            try {
+                const docRef = firebase.doc(db, `artifacts/${appId}/public/data/maintenance_slots`, slotId);
+                await firebase.updateDoc(docRef, {
+                    status: 'completed',
+                });
+                state.successMessage = "Job marked completed and archived.";
+            } catch (e) {
+                console.error("Error marking completed: ", e);
+                state.errorMessage = "Failed to mark job as complete.";
+            } finally {
+                renderApp();
+            }
+        };
+
+        const handleDeleteSlot = async (slotId) => {
+            const response = prompt('Are you sure you want to permanently delete this slot? Type YES to confirm.');
+            if (response !== 'YES') return;
+
+            try {
+                const docRef = firebase.doc(db, `artifacts/${appId}/public/data/maintenance_slots`, slotId);
+                await firebase.deleteDoc(docRef);
+                state.successMessage = "Slot deleted successfully.";
+            } catch (e) {
+                console.error("Error deleting slot: ", e);
+                state.errorMessage = "Failed to delete slot.";
+            } finally {
+                renderApp();
+            }
+        };
+
+        // Customer Handler
+        const handleConfirmBooking = async (name, details) => {
+            const slotId = state.slotToConfirm.id;
+            const customer = state.currentCustomer;
+            const messageElement = document.getElementById('booking-modal-message');
+            messageElement.textContent = '';
+
+            if (!customer) {
+                messageElement.innerHTML = `<span class="text-red-600">Error: Customer session lost. Please log out and back in.</span>`;
+                return;
+            }
+
+            try {
+                await firebase.runTransaction(db, async (transaction) => {
+                    // 1. Check Slot Status (Concurrency Control)
+                    const slotRef = firebase.doc(db, `artifacts/${appId}/public/data/maintenance_slots`, slotId);
+                    const slotDoc = await transaction.get(slotRef);
+                    
+                    if (!slotDoc.exists() || slotDoc.data().status !== 'available') {
+                        throw new Error("Slot is no longer available.");
+                    }
+
+                    // 2. Update Slot Status
+                    transaction.update(slotRef, {
+                        status: 'requested',
+                        customerId: customer.id,
+                        customerUserId: userId,
+                        name: name,
+                        address: customer.address, // Get address from customer profile
+                        details: details,
+                        requestedAt: firebase.serverTimestamp(),
+                    });
+
+                    // 3. Update Customer Booking Counts
+                    const customerRef = firebase.doc(db, `artifacts/${appId}/public/data/customers`, customer.id);
+                    const customerDoc = await transaction.get(customerRef);
+                    
+                    if (!customerDoc.exists()) {
+                        throw new Error("Customer profile not found.");
+                    }
+
+                    const currentData = customerDoc.data();
+                    const counts = currentData.bookingCounts || {};
+                    const currentYear = new Date().getFullYear().toString();
+                    const currentMonth = new Date().toISOString().substring(0, 7);
+                    
+                    // Defensive Initialization
+                    counts.total = (counts.total || 0) + 1;
+                    
+                    counts.yearly = counts.yearly || {};
+                    counts.yearly[currentYear] = (counts.yearly[currentYear] || 0) + 1;
+                    
+                    counts.monthly = counts.monthly || {};
+                    counts.monthly[currentMonth] = (counts.monthly[currentMonth] || 0) + 1;
+
+                    transaction.update(customerRef, {
+                        bookingCounts: counts,
+                    });
+                });
+
+                // Success Feedback
+                state.slotToConfirm = null;
+                state.successMessage = "Booking request submitted successfully! Awaiting Admin confirmation.";
+            } catch (e) {
+                console.error("Transaction failed: ", e);
+                messageElement.innerHTML = `<span class="text-red-600">Error: ${e.message || 'Failed to confirm booking due to an unexpected error.'}</span>`;
+            } finally {
+                renderApp();
+                hideModal('booking-modal');
+            }
+        };
+
+
+        // --- Startup ---
+
+        // Use a simple, non-crashing startup routine
+        const startApp = () => {
+            // Inject all modals once into the body
+            const modalContainer = document.createElement('div');
+            modalContainer.innerHTML = renderGlobalModals();
+            document.body.appendChild(modalContainer);
+            
+            // Attach initial static listeners (like Admin Modal trigger)
+            attachInitialModalListeners();
+
+            // Set loading state and start Firebase initialization
+            state.isLoading = true;
+            renderApp();
+            initializeFirebase();
+        };
+
+
+        // Guaranteed fix: Add a short delay after the DOM is fully loaded to ensure all external scripts
+        // are initialized before we attempt to run our code. This prevents the local file crash.
+        window.onload = () => {
+            // Wait 100ms after the document is ready. This is the fix for local white screen issues.
+            setTimeout(startApp, 100); 
+        };
+    </script>
+</body>
+</html>
