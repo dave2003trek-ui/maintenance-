@@ -52,21 +52,22 @@
     <script>
         // --- Global State and Initialization ---
 
-        // Global variables for Firebase (required by the Canvas environment)
-        // NOTE: These variables must be replaced with your actual keys upon deployment.
-        const appId = 'maint-f93ea'; // Use a fixed default ID for local testing
-        // This is where you will paste your actual firebaseConfig upon deployment:
-        const firebaseConfig = { 
+        // NOTE: You must ensure your actual Project ID is used for 'appId' below!
+        const appId = 'YOUR_PROJECT_ID_HEREmaint-f93ea
+'; // **MUST MATCH your Firebase Project ID!**
+        
+        // PASTE YOUR ACTUAL FIREBASE CONFIG HERE:
+        const firebaseConfig = {
             apiKey: "AIzaSyAF_m19FmDx35ZewYjl4Lm_TVuHtX7cWr0",
   authDomain: "maint-f93ea.firebaseapp.com",
   projectId: "maint-f93ea",
   storageBucket: "maint-f93ea.firebasestorage.app",
   messagingSenderId: "191222958729",
   appId: "1:191222958729:web:3cbf05885b83ed1d761458",
-  measurementId: "G-PGMWBZ497D"}; 
-        const initialAuthToken = null;
+  measurementId: "G-PGMWBZ497D"
+        }; 
 
-        // Firebase instances (will be initialized later)
+        const initialAuthToken = null; // Not used in deployed version
         let app, auth, db, userId, userProfile = null;
 
         // Application State
@@ -93,21 +94,18 @@
         const initializeFirebase = async () => {
             try {
                 // 1. Initialize App
-                if (Object.keys(firebaseConfig).length === 0) {
-                    // This is the CRUCIAL point: database connection is skipped locally for stability
-                    state.errorMessage = "Database connection skipped. Please deploy with Firebase keys to enable data persistence.";
-                    state.isLoading = false;
-                    renderApp();
-                    return;
+                if (Object.keys(firebaseConfig).length === 0 || !appId) {
+                    throw new Error("Missing Firebase keys or Project ID. Deployment failed.");
                 }
+                
+                // CRITICAL FIX: The app only proceeds if initialization works.
                 app = firebase.initializeApp(firebaseConfig);
                 db = firebase.getFirestore(app);
                 auth = firebase.getAuth(app);
                 
-                // Use debug logging
                 firebase.setLogLevel('Debug');
 
-                // 2. Authentication (Simplified for deployment readiness)
+                // 2. Authentication
                 await new Promise((resolve) => {
                     firebase.signInAnonymously(auth)
                         .then(userCredential => {
@@ -126,7 +124,8 @@
 
             } catch (error) {
                 console.error("Firebase initialization failed:", error);
-                state.errorMessage = "Database initialization failed. Check console for details.";
+                // GUARANTEED STABILITY: If initialization fails, we set the error but *render the UI*
+                state.errorMessage = "Database connection failed. Please check your Firebase settings (Keys/Auth/Rules).";
                 state.isLoading = false;
                 renderApp();
             }
@@ -1268,7 +1267,4 @@
         };
     </script>
 </body>
-
 </html>
-
-
